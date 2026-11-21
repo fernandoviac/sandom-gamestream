@@ -1,0 +1,14 @@
+Sandom GameStream
+Copyright 2026 DevBlanket AB
+
+The code written for Sandom is licensed under the Apache License, Version
+2.0. See LICENSE.
+
+The GameStream protocol modules come from Moonshine
+(https://github.com/hgaiser/moonshine), Copyright (c) 2024, Hans Gaiser,
+under the BSD 2-Clause License. See LICENSE-MOONSHINE, and docs/legal/ for
+the upstream commit, the extracted items and the local modifications.
+
+The Sandom and DevBlanket names and marks are not licensed by the Apache
+License. Use of those names is permitted only as required for reasonable and
+customary attribution or as separately authorized by DevBlanket AB.

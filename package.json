@@ -1,0 +1,12 @@
+{
+  "name": "@sandom/gamestream",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "BSD-2-Clause AND Apache-2.0",
+  "description": "A GameStream server for Moonlight clients, for Deno, Bun and Node.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fernandoviac/sandom-gamestream.git"
+  }
+}

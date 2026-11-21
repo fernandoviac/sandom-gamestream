@@ -1,0 +1,21 @@
+Third-party notices of the Sandom GameStream native libraries
+
+The native libraries contain the following Rust crates. Each section names a
+licence, lists the crates under it, and gives the licence text. The server's
+code from Moonshine is under LICENSE-MOONSHINE beside this file.
+
+Licences:
+{{#each overview}}
+  {{name}}: {{count}} crate(s)
+{{/each}}
+{{#each licenses}}
+
+================================================================================
+{{name}} ({{id}})
+Used by:
+{{#each used_by}}
+  {{crate.name}} {{crate.version}}{{#if crate.repository}} ({{crate.repository}}){{/if}}
+{{/each}}
+--------------------------------------------------------------------------------
+{{text}}
+{{/each}}

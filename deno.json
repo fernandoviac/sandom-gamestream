@@ -1,0 +1,6 @@
+{
+  "tasks": {
+    "build": "cargo build --release --workspace && deno run --allow-read --allow-write --allow-run=codesign tools/align-macho-string-table.js target/release",
+    "proof": "deno task build && deno run --allow-ffi --allow-read --allow-write --allow-net --allow-env tools/binding-proof.js"
+  }
+}

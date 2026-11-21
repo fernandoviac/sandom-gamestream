@@ -1,0 +1,16 @@
+[package]
+name = "sandom-gamestream-node"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause AND Apache-2.0"
+publish = false
+
+# The Node-API addon of the server: it forwards each call of
+# bindings/node.js to the C interface of the library (src/native.rs), which
+# it links.
+[lib]
+name = "sandom_gamestream_node"
+crate-type = ["cdylib"]
+
+[dependencies]
+sandom-gamestream = { path = ".." }
