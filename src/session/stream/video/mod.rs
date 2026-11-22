@@ -16,12 +16,9 @@ use tokio::sync::mpsc;
 use crate::session::{SessionKeysReceiver, SessionShutdownReason};
 
 mod gso_socket;
-mod packetizer;
-mod shard_batch;
 
 use gso_socket::UdpGsoSocket;
-use packetizer::{FrameType, Packetizer};
-use shard_batch::ShardBatch;
+use sandom_gamestream_protocol::video::{FrameType, Packetizer, ShardBatch};
 
 /// Configuration for the video stream.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -264,6 +261,9 @@ const SEND_QUEUE_FRAMES: usize = 8;
 
 struct VideoSender {
 	packetizer: Packetizer,
+	/// The session's keys; a new key id gives the packetizer the new key.
+	keys_rx: SessionKeysReceiver,
+	key_id: Option<i64>,
 	context: VideoStreamContext,
 	fec_percentage: u8,
 	frame_number: u32,
@@ -292,6 +292,16 @@ impl VideoStreamHandle {
 		}
 		let mut sender = self.sender.lock().unwrap_or_else(PoisonError::into_inner);
 		let sender = &mut *sender;
+		{
+			let keys = sender.keys_rx.borrow();
+			if sender.key_id != Some(keys.remote_input_key_id) {
+				sender
+					.packetizer
+					.set_key(&keys.remote_input_key)
+					.map_err(|error| format!("cannot encrypt the session's video: {error:#}"))?;
+				sender.key_id = Some(keys.remote_input_key_id);
+			}
+		}
 		sender.frame_number += 1;
 		let rtp_timestamp = (timestamp_us.max(0) as u64 * 9 / 100) as u32;
 		let shards = sender
@@ -307,7 +317,7 @@ impl VideoStreamHandle {
 				rtp_timestamp,
 				0,
 			)
-			.map_err(|()| format!("failed to packetize frame {} of {} bytes", sender.frame_number, data.len()))?;
+			.map_err(|error| format!("failed to packetize frame {} of {} bytes: {error:#}", sender.frame_number, data.len()))?;
 		sender.packets.try_send((sender.epoch, shards)).map_err(|error| match error {
 			mpsc::error::TrySendError::Full(_) => format!(
 				"the video send queue holds {SEND_QUEUE_FRAMES} frames that the socket has not sent; \
@@ -348,11 +358,20 @@ impl VideoStream {
 			socket.set_send_buffer(config.send_buffer_size);
 		}
 
-		let mut packetizer = Packetizer::new(context.encrypt_video, keys_rx);
-		packetizer.warm_up(config.fec_percentage, context.minimum_fec_packets);
+		let packetizer = Packetizer::new(context.encrypt_video);
+		// The encoders take seconds to build and are shared by every session;
+		// PLAY answers without waiting for them.
+		let (fec_percentage, minimum_fec_packets) = (config.fec_percentage, context.minimum_fec_packets);
+		tokio::task::spawn_blocking(move || {
+			if let Err(error) = Packetizer::warm_up(fec_percentage, minimum_fec_packets) {
+				tracing::error!("Building the Reed-Solomon encoders failed: {error:#}");
+			}
+		});
 		let (packets, packet_rx) = mpsc::channel(SEND_QUEUE_FRAMES);
 		let sender = VideoSender {
 			packetizer,
+			keys_rx,
+			key_id: None,
 			context,
 			fec_percentage: config.fec_percentage,
 			frame_number: 0,

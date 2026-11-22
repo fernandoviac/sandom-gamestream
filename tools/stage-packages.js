@@ -89,7 +89,10 @@ const legal = ["LICENSE", "LICENSE-MOONSHINE", "NOTICE"].map((name) => [name, ne
 // The bindings package.
 const bindings = [];
 for await (const entry of Deno.readDir(new URL("bindings/", repository))) {
-  if (entry.isFile && entry.name.endsWith(".js")) bindings.push([`bindings/${entry.name}`, new URL(`bindings/${entry.name}`, repository)]);
+  // The bindings' tests stay in the repository.
+  if (entry.isFile && entry.name.endsWith(".js") && !entry.name.endsWith(".test.js")) {
+    bindings.push([`bindings/${entry.name}`, new URL(`bindings/${entry.name}`, repository)]);
+  }
 }
 bindings.sort(([left], [right]) => left.localeCompare(right));
 await writePackage(new URL("gamestream/", output), {

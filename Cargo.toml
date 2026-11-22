@@ -1,6 +1,6 @@
 [package]
 name = "sandom-gamestream"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "BSD-2-Clause AND Apache-2.0"
 publish = false
@@ -11,32 +11,32 @@ publish = false
 crate-type = ["rlib", "cdylib"]
 
 [workspace]
-members = [".", "node"]
+members = [".", "client", "node", "protocol"]
+exclude = ["vendor/tokio-enet"]
+
+# tokio-enet 0.1.1 with ENet's retransmission timeout (docs/legal/tokio-enet.md).
+[patch.crates-io]
+tokio-enet = { path = "vendor/tokio-enet" }
 
 [dependencies]
 anyhow = "1"
-aes = "0.9.1"
-aes-gcm = "0.10.3"
+sandom-gamestream-protocol = { path = "protocol" }
 async-shutdown = "0.2.2"
 aws-lc-rs = "1.17.0"
 byteorder = "1.5.0"
 bytes = "1.11.1"
 cbc = "0.2.1"
-fec-rs = { version = "0.1.0", features = ["parallel"] }
 hex = "0.4.3"
 http-body-util = "0.1.3"
 hyper = { version = "1.10.1", features = ["server", "http1"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 inout = "0.2.2"
 quinn-udp = "0.6.1"
-rcgen = "0.14.8"
-rsa = "0.9.10"
 rtsp-types = "0.1.3"
 rustls = "0.23.40"
 rustls-pemfile = "2.2.0"
 sdp-types = "0.1.8"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
 sha2 = "0.11.0"
 socket2 = "0.6.4"
 strum_macros = "0.28.0"
@@ -51,3 +51,15 @@ x509-parser = "0.18.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# Reed-Solomon matrices (the server's encoder warm-up builds one per block
+# size at each session start) and RSA key generation take minutes
+# unoptimized; debug builds and tests optimize these crates.
+[profile.dev.package.fec-rs]
+opt-level = 3
+
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+
+[profile.dev.package.rsa]
+opt-level = 3

@@ -153,6 +153,10 @@ impl Webserver {
 				)
 			})?;
 
+		// Bound before `new` returns, so the server takes connections once it
+		// has started, and a port it cannot bind fails the start.
+		let listener =
+			bind_listener(http_address).map_err(|e| tracing::error!("Failed to bind to address {http_address}: {e}"))?;
 		tokio::spawn({
 			let server = server.clone();
 			let shutdown = shutdown.clone();
@@ -162,9 +166,6 @@ impl Webserver {
 				let _ = shutdown
 					.wrap_cancel(
 						shutdown.wrap_trigger_shutdown(ShutdownReason::HttpShutdown, async move {
-							let listener = bind_listener(http_address)
-								.map_err(|e| tracing::error!("Failed to bind to address {http_address}: {e}"))?;
-
 							tracing::debug!("HTTP server listening for connections on {http_address}");
 							loop {
 								let (connection, address) = listener
@@ -234,19 +235,18 @@ impl Webserver {
 				)
 			})?;
 
+		let listener = bind_listener(https_address)
+			.map_err(|e| tracing::error!("Failed to bind to address '{:?}': {e}", https_address))?;
+		let acceptor = std::sync::Arc::new(TlsAcceptor::from_config(
+			server.webserver_config.certificate.clone(),
+			server.webserver_config.private_key.clone(),
+		)?);
 		tokio::spawn({
 			let server = server.clone();
 			async move {
 				let _ = shutdown
 					.wrap_cancel(
 						shutdown.wrap_trigger_shutdown(ShutdownReason::HttpsShutdown, async move {
-							let listener = bind_listener(https_address)
-								.map_err(|e| tracing::error!("Failed to bind to address '{:?}': {e}", https_address))?;
-							let acceptor = std::sync::Arc::new(TlsAcceptor::from_config(
-								server.webserver_config.certificate.clone(),
-								server.webserver_config.private_key.clone(),
-							)?);
-
 							tracing::debug!("HTTPS server listening for connections on {https_address}");
 							loop {
 								let (connection, address) = listener

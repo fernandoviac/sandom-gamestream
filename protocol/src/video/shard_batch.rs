@@ -3,7 +3,7 @@
 /// Replaces `Vec<Vec<u8>>` to avoid one heap allocation per shard
 /// (~50–100 per frame). All shards are packed into a single `Vec<u8>`
 /// and accessed via `chunks_exact(shard_size)`.
-pub(crate) struct ShardBatch {
+pub struct ShardBatch {
 	/// Contiguous buffer holding `shard_count * shard_size` bytes.
 	data: Vec<u8>,
 	/// Size of each shard in bytes.

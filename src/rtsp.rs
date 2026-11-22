@@ -88,7 +88,7 @@ impl RtspServer {
 		control_config: ControlStreamConfig,
 		session_manager: SessionManager,
 		shutdown: ShutdownManager<ShutdownReason>,
-	) -> Self {
+	) -> Result<Self, ()> {
 		let server = Self {
 			address,
 			rtsp_port,
@@ -98,6 +98,18 @@ impl RtspServer {
 			session_manager,
 		};
 
+		// Bound before `new` returns, so the server takes connections once it
+		// has started, and a port it cannot bind fails the start.
+		let ip = server
+			.address
+			.parse::<IpAddr>()
+			.map_err(|e| tracing::error!("Failed to parse address '{}': {}", server.address, e))?;
+		let socket_addr = SocketAddr::new(ip, server.rtsp_port);
+		let listener = std::net::TcpListener::bind(socket_addr)
+			.and_then(|listener| listener.set_nonblocking(true).map(|()| listener))
+			.and_then(TcpListener::from_std)
+			.map_err(|e| tracing::error!("Failed to bind to address {}: {}", socket_addr, e))?;
+
 		tokio::spawn({
 			let server = server.clone();
 			async move {
@@ -105,15 +117,6 @@ impl RtspServer {
 					.wrap_cancel(shutdown.wrap_trigger_shutdown(ShutdownReason::RtspShutdown, {
 						let server = server.clone();
 						async move {
-							let ip = server
-								.address
-								.parse::<IpAddr>()
-								.map_err(|e| tracing::error!("Failed to parse address '{}': {}", server.address, e))?;
-							let socket_addr = SocketAddr::new(ip, server.rtsp_port);
-							let listener = TcpListener::bind(socket_addr)
-								.await
-								.map_err(|e| tracing::error!("Failed to bind to address {}: {}", socket_addr, e))?;
-
 							tracing::debug!("RTSP server listening on {}", socket_addr);
 
 							loop {
@@ -142,7 +145,7 @@ impl RtspServer {
 			}
 		});
 
-		server
+		Ok(server)
 	}
 
 	fn capabilities(&self) -> u8 {

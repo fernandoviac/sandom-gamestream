@@ -1,111 +1,46 @@
+//! Packetizing one encoded frame into shards, from Moonshine's
+//! `src/session/stream/video/packetizer.rs`.
+//!
+//! Sandom's changes: the caller sets the encryption key (`set_key`), and a
+//! key that is not 16 bytes is refused instead of turning encryption off.
+//! The Reed-Solomon encoders are built once per process and shared by every
+//! session: building all block sizes takes seconds, so `warm_up` runs apart
+//! from the session start, and a frame builds the encoder it lacks.
+
 use aes_gcm::{
 	Aes128Gcm, Key, Nonce,
 	aead::{AeadInPlace, KeyInit},
 };
+use anyhow::{Result, ensure};
 use fec_rs::ReedSolomon;
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::Instant;
 
-use crate::session::SessionKeysReceiver;
+/// The encoders of each (data, parity) shard count, built once.
+static ENCODERS: LazyLock<Mutex<HashMap<(usize, usize), Arc<ReedSolomon>>>> = LazyLock::new(Default::default);
 
-use crate::session::stream::video::shard_batch::{ShardBatch, ShardBuf};
-
-/// Maximum allowed number of shards in the encoder (data + parity).
-pub(crate) const MAX_SHARDS: usize = 255;
-
-const NV_VIDEO_PACKET_SIZE: usize = 16;
-const RTP_HEADER_SIZE: usize = 12;
-const PADDING_SIZE: usize = 4;
-/// Byte offset where the NvVideoPacket starts within a shard.
-const NV_PACKET_OFFSET: usize = RTP_HEADER_SIZE + PADDING_SIZE;
-/// Byte offset where the payload starts within a shard.
-const PAYLOAD_OFFSET: usize = NV_PACKET_OFFSET + NV_VIDEO_PACKET_SIZE;
-
-/// Size of the per-shard encryption prefix: iv(12) + frameNumber(4) + tag(16).
-const ENC_PREFIX_SIZE: usize = 12 + 4 + 16;
-
-/// Two-bit current and last block indices in `multiFecBlocks`.
-const MAX_FEC_BLOCKS: usize = 4;
-/// Ten-bit data count in `fecInfo`; zero does not represent 1024.
-const MAX_DATA_SHARDS_PER_BLOCK: usize = 1023;
-
-/// Choose the wire percentage first: Moonlight derives parity as
-/// ceil(data * percentage / 100). Some counts cannot be expressed by an
-/// eight-bit percentage, so the client minimum is bounded by both limits.
-fn fec_parameters(data_shards: usize, percentage: u8, minimum: u32) -> (usize, usize) {
-	let max_parity = MAX_SHARDS.saturating_sub(data_shards);
-	let minimum = (minimum as usize).min(max_parity);
-	let minimum_percentage = if minimum == 0 {
-		0
-	} else {
-		(minimum - 1) * 100 / data_shards + 1
-	};
-	let max_percentage = (max_parity * 100 / data_shards).min(u8::MAX as usize);
-	let percentage = (percentage as usize).max(minimum_percentage).min(max_percentage);
-	((data_shards * percentage).div_ceil(100), percentage)
-}
-
-#[repr(u8)]
-enum RtpFlag {
-	ContainsPicData = 0x1,
-	EndOfFrame = 0x2,
-	StartOfFrame = 0x4,
-}
-
-/// The frame types of the video frame header.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum FrameType {
-	Predicted = 1,
-	Key = 2,
-}
-
-#[derive(Debug)]
-#[repr(C)]
-struct VideoFrameHeader {
-	header_type: u8,
-	frame_processing_latency: u16,
-	frame_type: u8,
-	last_payload_len: u32,
-}
-
-const VIDEO_FRAME_HEADER_SIZE: usize = 8;
-
-impl VideoFrameHeader {
-	fn serialize(&self, buffer: &mut [u8]) {
-		buffer[0] = self.header_type;
-		buffer[1..3].copy_from_slice(&self.frame_processing_latency.to_le_bytes());
-		buffer[3] = self.frame_type;
-		buffer[4..8].copy_from_slice(&self.last_payload_len.to_le_bytes());
+/// The encoder of `data_shards` and `parity_shards`, from the cache or new.
+/// A new one is built without the cache's lock, so packetizing never waits
+/// for another size's build.
+fn shared_encoder(data_shards: usize, parity_shards: usize) -> Result<Arc<ReedSolomon>> {
+	if let Some(encoder) = ENCODERS.lock().unwrap_or_else(PoisonError::into_inner).get(&(data_shards, parity_shards)) {
+		return Ok(encoder.clone());
 	}
+	let encoder = Arc::new(ReedSolomon::new(data_shards, parity_shards).map_err(|error| {
+		anyhow::anyhow!("no Reed-Solomon code of {data_shards} data and {parity_shards} parity shards: {error}")
+	})?);
+	let mut encoders = ENCODERS.lock().unwrap_or_else(PoisonError::into_inner);
+	Ok(encoders.entry((data_shards, parity_shards)).or_insert(encoder).clone())
 }
 
-/// Write an RTP header directly into a byte slice at offset 0.
-fn write_rtp_header(buf: &mut [u8], sequence_number: u16, timestamp: u32) {
-	buf[0] = 0x90;
-	buf[1] = 0; // packet_type
-	buf[2..4].copy_from_slice(&sequence_number.to_be_bytes());
-	buf[4..8].copy_from_slice(&timestamp.to_be_bytes());
-	buf[8..12].copy_from_slice(&0u32.to_be_bytes()); // ssrc
-}
-
-/// Write an NvVideoPacket directly into a byte slice.
-fn write_nv_video_packet(
-	buf: &mut [u8],
-	stream_packet_index: u32,
-	frame_index: u32,
-	flags: u8,
-	multi_fec_blocks: u8,
-	fec_info: u32,
-) {
-	buf[0..4].copy_from_slice(&stream_packet_index.to_le_bytes());
-	buf[4..8].copy_from_slice(&frame_index.to_le_bytes());
-	buf[8] = flags;
-	buf[9] = 0; // reserved
-	buf[10] = 0x10; // multi_fec_flags
-	buf[11] = multi_fec_blocks;
-	buf[12..16].copy_from_slice(&fec_info.to_le_bytes());
-}
+use super::shard_batch::{ShardBatch, ShardBuf};
+use super::{
+	ENCRYPTION_PREFIX_SIZE, FLAG_CONTAINS_PIC_DATA, FLAG_END_OF_FRAME, FLAG_START_OF_FRAME, FecInfo, FrameType,
+	MAX_DATA_SHARDS_PER_BLOCK, MAX_FEC_BLOCKS, MAX_SHARDS, NV_PACKET_OFFSET, NV_VIDEO_PACKET_SIZE, NvVideoPacket,
+	PAYLOAD_OFFSET, VIDEO_FRAME_HEADER_SIZE, VideoFrameHeader, fec_parameters, shard_initialization_vector,
+	write_rtp_header,
+};
 
 /// Copy bytes from the logical [header ++ encoded_data] stream into a
 /// destination slice, without materializing the concatenation.
@@ -137,70 +72,47 @@ fn copy_header_and_data(
 	}
 }
 
-pub(crate) struct Packetizer {
-	fec_encoders: HashMap<(usize, usize), ReedSolomon>,
-	/// Watch channel for encryption keys — read eagerly per `packetize()` call.
-	keys_rx: SessionKeysReceiver,
-	/// Whether video encryption is enabled by the client.
+pub struct Packetizer {
+	/// Whether the client enabled video encryption.
 	encrypt: bool,
-	/// AES-128-GCM cipher for video encryption, `None` when disabled or uninitialized.
+	/// The AES-128-GCM cipher of the last key; None until `set_key`.
 	cipher: Option<Aes128Gcm>,
-	/// Last seen `remote_input_key_id` — used to detect key rotation.
-	last_key_id: i64,
-	/// Monotonically increasing IV counter (one increment per encrypted shard).
+	/// One increment per encrypted shard; a new key starts it at 0.
 	gcm_iv_counter: u64,
 }
 
 impl Packetizer {
-	pub fn new(encrypt: bool, keys_rx: SessionKeysReceiver) -> Self {
-		Self {
-			fec_encoders: HashMap::new(),
-			keys_rx,
-			encrypt,
-			cipher: None,
-			last_key_id: i64::MIN,
-			gcm_iv_counter: 0,
-		}
+	pub fn new(encrypt: bool) -> Self {
+		Self { encrypt, cipher: None, gcm_iv_counter: 0 }
 	}
 
-	/// Update the cipher if the encryption key has rotated.
-	/// Called eagerly at the start of each `packetize()` call.
-	fn maybe_update_cipher(&mut self) {
+	/// Encrypts later shards with `key`, the session's remote input key,
+	/// when the client enabled video encryption.
+	pub fn set_key(&mut self, key: &[u8]) -> Result<()> {
 		if !self.encrypt {
-			return;
+			return Ok(());
 		}
-		let keys = &*self.keys_rx.borrow();
-		if keys.remote_input_key_id == self.last_key_id {
-			return;
-		}
-		self.last_key_id = keys.remote_input_key_id;
-		if keys.remote_input_key.len() != 16 {
-			tracing::error!(
-				"Video encryption key must be exactly 16 bytes, got {}",
-				keys.remote_input_key.len()
-			);
-			self.cipher = None;
-			return;
-		}
-		let key = Key::<Aes128Gcm>::from_slice(&keys.remote_input_key);
-		self.cipher = Some(Aes128Gcm::new(key));
+		ensure!(key.len() == 16, "a video encryption key has 16 bytes, got {}", key.len());
+		self.cipher = Some(Aes128Gcm::new(Key::<Aes128Gcm>::from_slice(key)));
 		self.gcm_iv_counter = 0;
-		tracing::debug!("Video encryption cipher updated for key_id={}", self.last_key_id);
+		Ok(())
 	}
 
-	/// Pre-create FEC encoders for all possible block sizes to avoid
-	/// expensive ReedSolomon matrix construction during frame processing.
-	/// Frames that need more than four blocks have larger blocks with less
-	/// parity, so every size that can carry parity is covered.
-	pub fn warm_up(&mut self, fec_percentage: u8, minimum_fec_packets: u32) {
-		for nr_data_shards in 1..MAX_SHARDS {
-			let (nr_parity_shards, _) = fec_parameters(nr_data_shards, fec_percentage, minimum_fec_packets);
-			if nr_parity_shards > 0 {
-				let _ = self.get_fec_encoder(nr_data_shards, nr_parity_shards);
+	/// Builds the process's encoders for every block size that carries
+	/// parity at `fec_percentage`, so later frames find them built. Frames
+	/// that need more than four blocks have larger blocks with less parity,
+	/// so every size that can carry parity is covered. It takes seconds:
+	/// run it on a thread of its own.
+	pub fn warm_up(fec_percentage: u8, minimum_fec_packets: u32) -> Result<()> {
+		let start = Instant::now();
+		for data_shards in 1..MAX_SHARDS {
+			let (parity_shards, _) = fec_parameters(data_shards, fec_percentage, minimum_fec_packets);
+			if parity_shards > 0 {
+				shared_encoder(data_shards, parity_shards)?;
 			}
 		}
-
-		tracing::debug!("FEC encoder cache warmed with {} entries.", self.fec_encoders.len());
+		tracing::debug!("Built the Reed-Solomon encoders in {:?}.", start.elapsed());
+		Ok(())
 	}
 
 	/// Packetize an encoded frame into a batch of network-ready shards.
@@ -219,9 +131,11 @@ impl Packetizer {
 		sequence_number: &mut u32,
 		rtp_timestamp: u32,
 		frame_processing_latency: u16,
-	) -> Result<ShardBatch, ()> {
-		// Eagerly read current encryption key and update cipher if rotated.
-		self.maybe_update_cipher();
+	) -> Result<ShardBatch> {
+		ensure!(
+			!self.encrypt || self.cipher.is_some(),
+			"frame {frame_number} needs encryption and the packetizer has no key: call set_key first"
+		);
 
 		tracing::trace!(
 			"Packetizing frame {}, size={}, type={:?}",
@@ -239,28 +153,26 @@ impl Packetizer {
 			last_shard_size
 		};
 
-		let video_frame_header = VideoFrameHeader {
-			header_type: 0x01,
+		let header_bytes = VideoFrameHeader {
 			frame_processing_latency,
-			frame_type: frame_type as u8,
+			frame_type,
 			last_payload_len: last_shard_size as u32,
-		};
-
-		let mut header_bytes = [0u8; VIDEO_FRAME_HEADER_SIZE];
-		video_frame_header.serialize(&mut header_bytes);
+		}
+		.to_bytes();
 
 		// The total size of a shard (RTP + padding + NvVideoPacket + payload).
 		let requested_shard_size = PAYLOAD_OFFSET + requested_shard_payload_size;
 
 		// When encryption is enabled, reserve space for the per-shard prefix.
-		let prefix_size = if self.cipher.is_some() { ENC_PREFIX_SIZE } else { 0 };
+		let prefix_size = if self.cipher.is_some() { ENCRYPTION_PREFIX_SIZE } else { 0 };
 
 		let nr_data_shards = packet_data_len.div_ceil(requested_shard_payload_size);
 		assert!(nr_data_shards != 0);
-		if nr_data_shards > MAX_FEC_BLOCKS * MAX_DATA_SHARDS_PER_BLOCK {
-			tracing::warn!("Encoded frame {frame_number} needs {nr_data_shards} packets, exceeding the wire limit.");
-			return Err(());
-		}
+		ensure!(
+			nr_data_shards <= MAX_FEC_BLOCKS * MAX_DATA_SHARDS_PER_BLOCK,
+			"encoded frame {frame_number} needs {nr_data_shards} packets, over the wire limit of {}",
+			MAX_FEC_BLOCKS * MAX_DATA_SHARDS_PER_BLOCK
+		);
 
 		// As few blocks as the percentage allows, split evenly so every block
 		// gets the same protection (RFC 5052, section 9.1). A frame that needs
@@ -296,7 +208,7 @@ impl Packetizer {
 
 			let t_fec_encoder = Instant::now();
 			let encoder = if nr_parity_shards > 0 {
-				Some(self.get_fec_encoder(nr_data_shards, nr_parity_shards)?)
+				Some(shared_encoder(nr_data_shards, nr_parity_shards)?)
 			} else {
 				None
 			};
@@ -327,21 +239,21 @@ impl Packetizer {
 				// Padding (4 bytes of zeros) is already zeroed.
 
 				// Write NvVideoPacket header.
-				let mut flags = RtpFlag::ContainsPicData as u8;
+				let mut flags = FLAG_CONTAINS_PIC_DATA;
 				if block_shard_index == 0 {
-					flags |= RtpFlag::StartOfFrame as u8;
+					flags |= FLAG_START_OF_FRAME;
 				}
 				if block_shard_index == nr_data_shards - 1 {
-					flags |= RtpFlag::EndOfFrame as u8;
+					flags |= FLAG_END_OF_FRAME;
 				}
-				write_nv_video_packet(
-					&mut shard[NV_PACKET_OFFSET..NV_PACKET_OFFSET + NV_VIDEO_PACKET_SIZE],
-					*sequence_number << 8,
-					frame_number,
+				NvVideoPacket {
+					stream_packet_index: *sequence_number << 8,
+					frame_index: frame_number,
 					flags,
-					((block_index as u8) << 4) | last_block_index,
-					(block_shard_index << 12 | nr_data_shards << 22 | fec_percentage << 4) as u32,
-				);
+					multi_fec_blocks: ((block_index as u8) << 4) | last_block_index,
+					fec_info: FecInfo { shard_index: block_shard_index, data_shards: nr_data_shards, percentage: fec_percentage },
+				}
+				.write(&mut shard[NV_PACKET_OFFSET..NV_PACKET_OFFSET + NV_VIDEO_PACKET_SIZE]);
 
 				// Copy payload from [header ++ encoded_data].
 				copy_header_and_data(
@@ -369,7 +281,7 @@ impl Packetizer {
 
 				encoder
 					.encode(&mut fec_slices)
-					.map_err(|e| tracing::warn!("Failed to encode packet as FEC shards: {e}"))?;
+					.map_err(|e| anyhow::anyhow!("Reed-Solomon encoding of frame {frame_number} failed: {e}"))?;
 
 				total_fec_compute_us += t_fec_compute.elapsed().as_micros();
 
@@ -389,10 +301,12 @@ impl Packetizer {
 					let nv = &mut shard[NV_PACKET_OFFSET..NV_PACKET_OFFSET + NV_VIDEO_PACKET_SIZE];
 					nv[4..8].copy_from_slice(&frame_number.to_le_bytes()); // frame_index
 					nv[11] = ((block_index as u8) << 4) | last_block_index; // multi_fec_blocks
-					let fec_info = ((nr_data_shards + block_shard_index) << 12
-						| nr_data_shards << 22
-						| fec_percentage << 4) as u32;
-					nv[12..16].copy_from_slice(&fec_info.to_le_bytes()); // fec_info
+					let fec_info = FecInfo {
+						shard_index: nr_data_shards + block_shard_index,
+						data_shards: nr_data_shards,
+						percentage: fec_percentage,
+					};
+					nv[12..16].copy_from_slice(&fec_info.to_u32().to_le_bytes()); // fec_info
 
 					*sequence_number += 1;
 				}
@@ -403,10 +317,7 @@ impl Packetizer {
 			// Encrypt each shard if video encryption is enabled.
 			if let Some(cipher) = &self.cipher {
 				for shard_index in 0..total_shards {
-					// Build the 12-byte IV: bytes 0..8 = counter (LE), byte 11 = 'V'.
-					let mut iv = [0u8; 12];
-					iv[..8].copy_from_slice(&self.gcm_iv_counter.to_le_bytes());
-					iv[11] = b'V';
+					let iv = shard_initialization_vector(self.gcm_iv_counter);
 					self.gcm_iv_counter += 1;
 
 					let nonce = Nonce::from_slice(&iv);
@@ -415,7 +326,7 @@ impl Packetizer {
 					let shard_data = shard_buf.shard_mut(shard_index);
 					let tag = cipher
 						.encrypt_in_place_detached(nonce, b"", shard_data)
-						.map_err(|e| tracing::warn!("Failed to encrypt video shard: {e}"))?;
+						.map_err(|_| anyhow::anyhow!("AES-GCM encryption of a shard of frame {frame_number} failed"))?;
 
 					// Fill the encryption prefix: iv(12) + frameNumber(4) + tag(16).
 					let prefix = shard_buf.prefix_mut(shard_index);
@@ -438,25 +349,6 @@ impl Packetizer {
 
 		Ok(all_shards)
 	}
-
-	fn get_fec_encoder(&mut self, nr_data_shards: usize, nr_parity_shards: usize) -> Result<&mut ReedSolomon, ()> {
-		Ok(match self.fec_encoders.entry((nr_data_shards, nr_parity_shards)) {
-			Entry::Occupied(e) => {
-				tracing::trace!("Found a FEC encoder for this combination of shards.");
-				e.into_mut()
-			},
-			Entry::Vacant(e) => {
-				tracing::trace!("No FEC encoder for this combination of shards, creating a new one.");
-				let encoder = e.insert(
-					ReedSolomon::new(nr_data_shards, nr_parity_shards)
-						.map_err(|e| tracing::warn!("Couldn't create error correction encoder: {e}"))?,
-				);
-				tracing::trace!("Finished preparing FEC encoder.");
-
-				encoder
-			},
-		})
-	}
 }
 
 #[cfg(test)]
@@ -465,11 +357,7 @@ mod tests {
 	use std::collections::BTreeMap;
 
 	fn packetizer() -> Packetizer {
-		let (_, keys) = tokio::sync::watch::channel(crate::session::SessionKeyData {
-			remote_input_key: vec![0x42; 16],
-			remote_input_key_id: 1,
-		});
-		Packetizer::new(false, keys)
+		Packetizer::new(false)
 	}
 
 	/// A frame that exactly fills `data_shards` packets of 80 bytes.

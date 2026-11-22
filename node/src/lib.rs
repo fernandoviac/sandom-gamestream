@@ -200,8 +200,8 @@ unsafe extern "C" fn doorbell_close(env: napi_env, info: napi_callback_info) -> 
     }) }
 }
 
-/// `start(config, doorbell)`: `config` is the JSON configuration as a
-/// Uint8Array, `doorbell` the handle of `doorbell(...)`.
+/// `start(config, doorbell)`: `config` is the binary configuration record
+/// (src/native.rs), `doorbell` the handle of `doorbell(...)`.
 unsafe extern "C" fn start(env: napi_env, info: napi_callback_info) -> napi_value {
     unsafe { call(env, info, |arguments| {
         let (config, config_length) = arguments.bytes(0)?;

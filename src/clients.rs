@@ -3,17 +3,10 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aes::Aes128;
-use aes::cipher::Array;
-use aes::cipher::BlockCipherDecrypt;
-use aes::cipher::BlockCipherEncrypt;
-use aes::cipher::KeyInit;
 use aws_lc_rs::rand::SecureRandom;
 use aws_lc_rs::rand::SystemRandom;
-use aws_lc_rs::signature::KeyPair;
-use aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA256;
-use aws_lc_rs::signature::RSA_PKCS1_SHA256;
-use aws_lc_rs::signature::RsaKeyPair;
+use sandom_gamestream_protocol::crypto::{ecb_decrypt, ecb_encrypt, pairing_key};
+use sandom_gamestream_protocol::pairing::{certificate_signature, sign, verify_signature};
 use sha2::Digest;
 use sha2::Sha256;
 use tokio::sync::Notify;
@@ -110,7 +103,7 @@ impl ClientManager {
 		let client = inner.get_mut(id).ok_or_else(|| {
 			tracing::warn!("No known client with id {id}");
 		})?;
-		let key = create_key(&client.salt, pin).map_err(|e| tracing::warn!("Failed to create client key: {e}"))?;
+		let key = pairing_key(&client.salt, pin);
 		client.key = Some(key);
 		client.pin_notify.notify_waiters();
 		Ok(())
@@ -139,10 +132,10 @@ impl ClientManager {
 		client.server_secret = Some(server_secret);
 
 		let mut decrypted =
-			aes_decrypt_ecb(&challenge, key).map_err(|e| tracing::warn!("Failed to decrypt client challenge: {e}"))?;
+			ecb_decrypt(&challenge, key).map_err(|e| tracing::warn!("Failed to decrypt client challenge: {e:#}"))?;
 
-		let signature_bytes = extract_certificate_signature(&self.server_cert_pem)
-			.map_err(|e| tracing::warn!("Failed to extract server cert signature: {e}"))?;
+		let signature_bytes = certificate_signature(&self.server_cert_pem)
+			.map_err(|e| tracing::warn!("Failed to extract server cert signature: {e:#}"))?;
 		decrypted.extend_from_slice(&signature_bytes);
 		decrypted.extend_from_slice(&server_secret);
 
@@ -159,8 +152,8 @@ impl ClientManager {
 		let mut challenge_response_decrypted = challenge_response_hash.to_vec();
 		challenge_response_decrypted.extend(server_challenge);
 
-		aes_encrypt_ecb(&challenge_response_decrypted, key)
-			.map_err(|e| tracing::warn!("Failed to encrypt client challenge response: {e}"))
+		ecb_encrypt(&challenge_response_decrypted, key)
+			.map_err(|e| tracing::warn!("Failed to encrypt client challenge response: {e:#}"))
 	}
 
 	pub(crate) fn server_challenge_response(&self, id: &str, challenge_response: Vec<u8>) -> Result<Vec<u8>, ()> {
@@ -179,8 +172,8 @@ impl ClientManager {
 			},
 		};
 
-		let decrypted = aes_decrypt_ecb(&challenge_response, key)
-			.map_err(|e| tracing::warn!("Failed to decrypt server challenge response: {e}"))?;
+		let decrypted = ecb_decrypt(&challenge_response, key)
+			.map_err(|e| tracing::warn!("Failed to decrypt server challenge response: {e:#}"))?;
 		client.client_hash = Some(decrypted);
 
 		let server_secret = client.server_secret.ok_or_else(|| {
@@ -189,7 +182,7 @@ impl ClientManager {
 
 		let mut pairing_secret = server_secret.to_vec();
 		let signed = sign(&server_secret, &self.server_private_key_pem)
-			.map_err(|e| tracing::warn!("Failed to sign server secret: {e}"))?;
+			.map_err(|e| tracing::warn!("Failed to sign server secret: {e:#}"))?;
 		pairing_secret.extend(signed);
 
 		Ok(pairing_secret)
@@ -236,61 +229,6 @@ impl ClientManager {
 	}
 }
 
-fn create_key(salt: &[u8; 16], pin: &str) -> Result<[u8; 16], String> {
-	let mut key = Vec::with_capacity(salt.len() + pin.len());
-	key.extend(salt);
-	key.extend(pin.as_bytes());
-
-	let mut hasher = Sha256::new();
-	hasher.update(&key);
-	let hash = hasher.finalize();
-
-	hash[..16]
-		.try_into()
-		.map_err(|e| format!("Received unexpected key result: {e}"))
-}
-
-fn sign(data: &[u8], key_pem: &str) -> Result<Vec<u8>, String> {
-	let key_bytes = {
-		let mut reader = std::io::Cursor::new(key_pem.as_bytes());
-		match rustls_pemfile::private_key(&mut reader) {
-			Ok(Some(key)) => key.secret_der().to_vec(),
-			Ok(None) => return Err("No key found in PEM".to_string()),
-			Err(e) => return Err(format!("Failed to parse key PEM: {}", e)),
-		}
-	};
-
-	let key_pair = RsaKeyPair::from_pkcs8(&key_bytes).map_err(|e| format!("Failed to load RSA key pair: {}", e))?;
-
-	let rng = SystemRandom::new();
-	let mut signature = vec![0; key_pair.public_key().modulus_len()];
-
-	key_pair
-		.sign(&RSA_PKCS1_SHA256, &rng, data, &mut signature)
-		.map_err(|e| format!("Failed to sign data: {}", e))?;
-	Ok(signature)
-}
-
-fn extract_certificate_signature(pem: &str) -> Result<Vec<u8>, String> {
-	let (_, pem_obj) = parse_x509_pem(pem.as_bytes()).map_err(|e| format!("Failed to parse PEM: {}", e))?;
-	let cert = pem_obj
-		.parse_x509()
-		.map_err(|e| format!("Failed to parse X509: {}", e))?;
-	Ok(cert.signature_value.data.to_vec())
-}
-
-fn verify_client_signature(pem: &str, secret: &[u8], signature: &[u8]) -> Result<(), String> {
-	let (_, pem_obj) = parse_x509_pem(pem.as_bytes()).map_err(|e| format!("Failed to parse PEM: {}", e))?;
-	let cert = pem_obj
-		.parse_x509()
-		.map_err(|e| format!("Failed to parse X509: {}", e))?;
-	let public_key_bytes = cert.tbs_certificate.subject_pki.subject_public_key.data;
-	let public_key = aws_lc_rs::signature::UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, public_key_bytes);
-	public_key.verify(secret, signature).map_err(|_| {
-		"Client certificate signature verification failed: signature does not match the client's public key".to_string()
-	})
-}
-
 fn verify_pairing_secret(client: &mut PendingClient, client_secret: Vec<u8>) -> Result<(), String> {
 	let client_hash = match &client.client_hash {
 		Some(client_hash) => client_hash,
@@ -316,8 +254,8 @@ fn verify_pairing_secret(client: &mut PendingClient, client_secret: Vec<u8>) -> 
 
 	let mut data = server_challenge.to_vec();
 
-	let signature_bytes = extract_certificate_signature(&client.pem)
-		.map_err(|e| format!("Failed to extract client cert signature: {e}"))?;
+	let signature_bytes = certificate_signature(&client.pem)
+		.map_err(|e| format!("Failed to extract client cert signature: {e:#}"))?;
 	data.extend(signature_bytes);
 	data.extend(client_secret_payload);
 
@@ -329,39 +267,10 @@ fn verify_pairing_secret(client: &mut PendingClient, client_secret: Vec<u8>) -> 
 		return Err("Client hash is not as expected, MITM?".to_string());
 	}
 
-	verify_client_signature(&client.pem, client_secret_payload, client_signature)?;
+	verify_signature(&client.pem, client_secret_payload, client_signature)
+		.map_err(|e| format!("Client certificate signature verification failed: {e:#}"))?;
 
 	Ok(())
-}
-
-fn aes_encrypt_ecb(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
-	let key: Array<u8, _> = (*key).into();
-	let cipher = Aes128::new(&key);
-	if !data.len().is_multiple_of(16) {
-		return Err(format!("Data length {} not a multiple of 16", data.len()));
-	}
-
-	let mut encrypted = data.to_vec();
-	for block in encrypted.chunks_mut(16) {
-		let gblock: &mut aes::cipher::Array<u8, _> = block.try_into().map_err(|_| "Invalid block length")?;
-		cipher.encrypt_block(gblock);
-	}
-	Ok(encrypted)
-}
-
-fn aes_decrypt_ecb(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
-	let key: Array<u8, _> = (*key).into();
-	let cipher = Aes128::new(&key);
-	if !data.len().is_multiple_of(16) {
-		return Err(format!("Data length {} not a multiple of 16", data.len()));
-	}
-
-	let mut decrypted = data.to_vec();
-	for block in decrypted.chunks_mut(16) {
-		let gblock: &mut aes::cipher::Array<u8, _> = block.try_into().map_err(|_| "Invalid block length")?;
-		cipher.decrypt_block(gblock);
-	}
-	Ok(decrypted)
 }
 
 fn cert_pem_fingerprint(pem: &str) -> Option<String> {

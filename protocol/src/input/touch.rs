@@ -1,3 +1,7 @@
+//! Touch and pen events: 28 bytes each, little-endian. Positions are
+//! fractions of the screen, 0 to 1.
+
+use anyhow::{Result, bail, ensure};
 use strum_macros::FromRepr;
 
 const POINTER_PAYLOAD_SIZE: usize = 28;
@@ -29,7 +33,9 @@ pub enum PenToolKind {
 	Eraser = 0x02,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// A touch contact: event (1), padding (3), pointer id (u32 LE), x (f32
+/// LE), y (f32 LE), and contact-area fields that this server does not read.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Touch {
 	pub event_kind: PointerEventKind,
 	pub pointer_id: u32,
@@ -37,36 +43,40 @@ pub struct Touch {
 	pub y: f32,
 }
 
-impl Touch {
-	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
-		if buffer.len() < POINTER_PAYLOAD_SIZE {
-			tracing::warn!(
-				"Expected at least {POINTER_PAYLOAD_SIZE} bytes for Touch, got {} bytes.",
-				buffer.len()
-			);
-			return Err(());
-		}
-
-		let event_kind = PointerEventKind::from_repr(buffer[0])
-			.ok_or_else(|| tracing::warn!(event_type = buffer[0], "Unknown touch event type"))?;
-		let x = f32::from_le_bytes(buffer[8..12].try_into().unwrap());
-		let y = f32::from_le_bytes(buffer[12..16].try_into().unwrap());
-
-		if event_kind.has_position() && (!x.is_finite() || !y.is_finite()) {
-			tracing::warn!(?x, ?y, "Ignoring touch event with non-finite coordinates");
-			return Err(());
-		}
-
-		Ok(Self {
-			event_kind,
-			pointer_id: u32::from_le_bytes(buffer[4..8].try_into().unwrap()),
-			x,
-			y,
-		})
+fn event_kind(byte: u8) -> Result<PointerEventKind> {
+	match PointerEventKind::from_repr(byte) {
+		Some(kind) => Ok(kind),
+		None => bail!("unknown pointer event kind {byte}"),
 	}
 }
 
-#[derive(Debug, Clone, Copy)]
+impl Touch {
+	pub fn from_bytes(buffer: &[u8]) -> Result<Self> {
+		ensure!(buffer.len() >= POINTER_PAYLOAD_SIZE, "a touch event has {POINTER_PAYLOAD_SIZE} bytes, got {}", buffer.len());
+		let event_kind = event_kind(buffer[0])?;
+		let x = f32::from_le_bytes(buffer[8..12].try_into().unwrap());
+		let y = f32::from_le_bytes(buffer[12..16].try_into().unwrap());
+		ensure!(
+			!event_kind.has_position() || (x.is_finite() && y.is_finite()),
+			"a touch {event_kind:?} event has the non-finite position ({x}, {y})"
+		);
+		Ok(Self { event_kind, pointer_id: u32::from_le_bytes(buffer[4..8].try_into().unwrap()), x, y })
+	}
+
+	pub fn to_bytes(&self) -> [u8; POINTER_PAYLOAD_SIZE] {
+		let mut buffer = [0u8; POINTER_PAYLOAD_SIZE];
+		buffer[0] = self.event_kind as u8;
+		buffer[4..8].copy_from_slice(&self.pointer_id.to_le_bytes());
+		buffer[8..12].copy_from_slice(&self.x.to_le_bytes());
+		buffer[12..16].copy_from_slice(&self.y.to_le_bytes());
+		buffer
+	}
+}
+
+/// A pen event: event (1), tool (1), buttons (1), padding (1), x, y and
+/// pressure or distance (f32 LE each), rotation (u16 LE), tilt (1), and
+/// padding.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Pen {
 	pub event_kind: PointerEventKind,
 	pub tool_kind: PenToolKind,
@@ -79,33 +89,20 @@ pub struct Pen {
 }
 
 impl Pen {
-	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
-		if buffer.len() < POINTER_PAYLOAD_SIZE {
-			tracing::warn!(
-				"Expected at least {POINTER_PAYLOAD_SIZE} bytes for Pen, got {} bytes.",
-				buffer.len()
-			);
-			return Err(());
-		}
-
-		let event_kind = PointerEventKind::from_repr(buffer[0])
-			.ok_or_else(|| tracing::warn!(event_type = buffer[0], "Unknown pen event type"))?;
-		let tool_kind = PenToolKind::from_repr(buffer[1])
-			.ok_or_else(|| tracing::warn!(tool_type = buffer[1], "Unknown pen tool type"))?;
+	pub fn from_bytes(buffer: &[u8]) -> Result<Self> {
+		ensure!(buffer.len() >= POINTER_PAYLOAD_SIZE, "a pen event has {POINTER_PAYLOAD_SIZE} bytes, got {}", buffer.len());
+		let event_kind = event_kind(buffer[0])?;
+		let tool_kind = match PenToolKind::from_repr(buffer[1]) {
+			Some(kind) => kind,
+			None => bail!("unknown pen tool kind {}", buffer[1]),
+		};
 		let x = f32::from_le_bytes(buffer[4..8].try_into().unwrap());
 		let y = f32::from_le_bytes(buffer[8..12].try_into().unwrap());
 		let pressure_or_distance = f32::from_le_bytes(buffer[12..16].try_into().unwrap());
-
-		if event_kind.has_position() && (!x.is_finite() || !y.is_finite() || !pressure_or_distance.is_finite()) {
-			tracing::warn!(
-				?x,
-				?y,
-				?pressure_or_distance,
-				"Ignoring pen event with non-finite values"
-			);
-			return Err(());
-		}
-
+		ensure!(
+			!event_kind.has_position() || (x.is_finite() && y.is_finite() && pressure_or_distance.is_finite()),
+			"a pen {event_kind:?} event has the non-finite values ({x}, {y}, {pressure_or_distance})"
+		);
 		Ok(Self {
 			event_kind,
 			tool_kind,
@@ -116,6 +113,19 @@ impl Pen {
 			rotation: u16::from_le_bytes(buffer[16..18].try_into().unwrap()),
 			tilt: buffer[18],
 		})
+	}
+
+	pub fn to_bytes(&self) -> [u8; POINTER_PAYLOAD_SIZE] {
+		let mut buffer = [0u8; POINTER_PAYLOAD_SIZE];
+		buffer[0] = self.event_kind as u8;
+		buffer[1] = self.tool_kind as u8;
+		buffer[2] = self.buttons;
+		buffer[4..8].copy_from_slice(&self.x.to_le_bytes());
+		buffer[8..12].copy_from_slice(&self.y.to_le_bytes());
+		buffer[12..16].copy_from_slice(&self.pressure_or_distance.to_le_bytes());
+		buffer[16..18].copy_from_slice(&self.rotation.to_le_bytes());
+		buffer[18] = self.tilt;
+		buffer
 	}
 }
 
@@ -159,6 +169,23 @@ mod tests {
 		assert_eq!(pen.pressure_or_distance, 0.6);
 		assert_eq!(pen.rotation, 270);
 		assert_eq!(pen.tilt, 35);
+	}
+
+	#[test]
+	fn touch_and_pen_round_trip() {
+		let touch = Touch { event_kind: PointerEventKind::Up, pointer_id: 7, x: 0.5, y: 0.125 };
+		assert_eq!(Touch::from_bytes(&touch.to_bytes()).unwrap(), touch);
+		let pen = Pen {
+			event_kind: PointerEventKind::Hover,
+			tool_kind: PenToolKind::Eraser,
+			buttons: 1,
+			x: 0.25,
+			y: 0.5,
+			pressure_or_distance: 0.75,
+			rotation: 90,
+			tilt: 12,
+		};
+		assert_eq!(Pen::from_bytes(&pen.to_bytes()).unwrap(), pen);
 	}
 
 	#[test]

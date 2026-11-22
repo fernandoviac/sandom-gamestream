@@ -17,7 +17,6 @@ use std::sync::Arc;
 use async_shutdown::ShutdownManager;
 
 pub(crate) mod clients;
-pub(crate) mod crypto;
 pub(crate) mod rtsp;
 pub(crate) mod session;
 pub(crate) mod state;
@@ -25,7 +24,7 @@ pub(crate) mod tls;
 pub(crate) mod webserver;
 pub mod native;
 
-pub use session::stream::control::input::{
+pub use sandom_gamestream_protocol::input::{
 	InputEvent, Key, MouseButton, MouseMoveAbsolute, MouseMoveRelative, MouseScrollHorizontal, MouseScrollVertical,
 	Pen, PenToolKind, PointerEventKind, Touch,
 };
@@ -192,7 +191,14 @@ impl Server {
 				events.clone(),
 				shutdown.clone(),
 			)
-			.map_err(|()| anyhow::anyhow!("cannot start the webserver on {}", config.bind_address))?;
+			.map_err(|()| {
+				anyhow::anyhow!(
+					"cannot start the webserver on {} (HTTP port {}, HTTPS port {}): see the log for the cause",
+					config.bind_address,
+					config.ports.http,
+					config.ports.https
+				)
+			})?;
 			rtsp::RtspServer::new(
 				config.bind_address.clone(),
 				config.ports.rtsp,
@@ -201,7 +207,10 @@ impl Server {
 				stream.control.clone(),
 				session_manager.clone(),
 				shutdown.clone(),
-			);
+			)
+			.map_err(|()| {
+				anyhow::anyhow!("cannot start the RTSP server on {} port {}: see the log for the cause", config.bind_address, config.ports.rtsp)
+			})?;
 			anyhow::Ok(())
 		})?;
 

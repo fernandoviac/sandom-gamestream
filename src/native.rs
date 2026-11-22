@@ -1,40 +1,45 @@
 //! The C interface of the server, which Deno's FFI and the Node-API addon
-//! (node/) call. A program starts a server with its configuration as JSON
-//! and a doorbell: the server rings the doorbell from its own threads when
-//! its event queue turns non-empty, and the program then takes every event
-//! as a JSON record with `sandom_gamestream_take_event` until none is left.
+//! (node/) call. A program starts a server with its binary configuration and
+//! a doorbell: the server rings the doorbell from its own threads when its
+//! event queue turns non-empty, and the program then takes every event
+//! record with `sandom_gamestream_take_event` until none is left. Numbers
+//! are little-endian; a string is its byte length (u32) and its UTF-8.
 //!
-//! Event records:
+//! Configuration: version (u8, 1); the ports `http`, `https`, `rtsp`,
+//! `video`, `control` and `audio` (u16 each, 0 for the GameStream default);
+//! then the strings host name, certificate directory, application title and
+//! bind address.
 //!
-//! - `{"kind":"pinRequired","client":<uniqueid>}`
-//! - `{"kind":"sessionStarted","width","height","fps","codec":"h264","bitrate","maxReferenceFrames","fullRange"}`
-//! - `{"kind":"keyFrameRequested"}`
-//! - `{"kind":"input","input":<input record>}`
-//! - `{"kind":"sessionEnded"}`
+//! Event records, by their first byte:
 //!
-//! Input records, by `type`: `keyDown` and `keyUp` (`key`, the Windows
-//! virtual-key code, and `name`); `mouseMoveAbsolute` (`x`, `y`,
-//! `screenWidth`, `screenHeight`); `mouseMoveRelative` (`x`, `y`);
-//! `mouseButtonDown` and `mouseButtonUp` (`button`: `left`, `middle`,
-//! `right`, `side` or `extra`); `scrollVertical` and `scrollHorizontal`
-//! (`amount`, 120 per notch); `touch` (`event`, `pointerId`, `x`, `y` in
-//! 0..1 of the stream); `pen` (`event`, `tool`, `buttons`, `x`, `y`,
-//! `pressureOrDistance`, `rotation`, `tilt`); `text` (`text`). A pointer
-//! `event` is `hover`, `down`, `up`, `move`, `cancel`, `buttonOnly`,
-//! `hoverLeave` or `cancelAll`; a pen `tool` is `unknown`, `pen` or
-//! `eraser`.
+//! - 1, pin required: the client's unique ID (string).
+//! - 2, session started: width, height and fps (u32 each), codec (u8, 1 for
+//!   H.264), bit rate in bits per second (u64), maximum reference frames
+//!   (u32), full range (u8, 0 or 1).
+//! - 3, key frame requested.
+//! - 4, input: the input event in the GameStream protocol's binary format
+//!   (`sandom_gamestream_protocol::input`), to the record's end.
+//! - 5, session ended.
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use serde::Deserialize;
-use serde_json::{Value, json};
+use anyhow::{Context, ensure};
 
-use crate::{
-	Codec, InputEvent, MouseButton, PenToolKind, PointerEventKind, Server, ServerConfig, ServerEvent, ServerPorts,
-};
+use crate::{Codec, Server, ServerConfig, ServerEvent, ServerPorts};
+
+/// The version of the configuration record.
+const CONFIGURATION_VERSION: u8 = 1;
+
+pub const EVENT_PIN_REQUIRED: u8 = 1;
+pub const EVENT_SESSION_STARTED: u8 = 2;
+pub const EVENT_KEY_FRAME_REQUESTED: u8 = 3;
+pub const EVENT_INPUT: u8 = 4;
+pub const EVENT_SESSION_ENDED: u8 = 5;
+/// The codec byte of a session-started record.
+pub const CODEC_H264: u8 = 1;
 
 /// `std::sync::Mutex`, whose holders never panic: a poisoned lock is a
 /// defect of this module.
@@ -53,30 +58,6 @@ impl<T> Mutex<T> {
 /// Rung from a server thread when the event queue turns non-empty.
 pub type Doorbell = extern "C" fn(context: *mut c_void);
 
-/// The configuration record of `sandom_gamestream_start`; a port left out
-/// is the GameStream default.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct StartRecord {
-	host_name: String,
-	certificate_directory: PathBuf,
-	application_title: String,
-	bind_address: String,
-	#[serde(default)]
-	ports: PortsRecord,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PortsRecord {
-	http: Option<u16>,
-	https: Option<u16>,
-	rtsp: Option<u16>,
-	video: Option<u16>,
-	control: Option<u16>,
-	audio: Option<u16>,
-}
-
 struct Ring {
 	doorbell: Doorbell,
 	context: usize,
@@ -88,12 +69,11 @@ struct Queue {
 }
 
 impl Queue {
-	fn push(&self, record: Value) {
-		let bytes = serde_json::to_vec(&record).expect("an event record serializes");
+	fn push(&self, record: Vec<u8>) {
 		let was_empty = {
 			let mut events = self.events.lock();
 			let was_empty = events.is_empty();
-			events.push_back(bytes);
+			events.push_back(record);
 			was_empty
 		};
 		if was_empty {
@@ -110,62 +90,87 @@ pub struct NativeServer {
 	last_error: Mutex<String>,
 }
 
-fn pointer_event(kind: PointerEventKind) -> &'static str {
-	match kind {
-		PointerEventKind::Hover => "hover",
-		PointerEventKind::Down => "down",
-		PointerEventKind::Up => "up",
-		PointerEventKind::Move => "move",
-		PointerEventKind::Cancel => "cancel",
-		PointerEventKind::ButtonOnly => "buttonOnly",
-		PointerEventKind::HoverLeave => "hoverLeave",
-		PointerEventKind::CancelAll => "cancelAll",
-	}
+fn push_string(record: &mut Vec<u8>, text: &str) {
+	record.extend((text.len() as u32).to_le_bytes());
+	record.extend(text.as_bytes());
 }
 
-fn mouse_button(button: MouseButton) -> &'static str {
-	match button {
-		MouseButton::Left => "left",
-		MouseButton::Middle => "middle",
-		MouseButton::Right => "right",
-		MouseButton::Side => "side",
-		MouseButton::Extra => "extra",
-	}
-}
-
-fn input_record(input: InputEvent) -> Value {
-	match input {
-		InputEvent::KeyDown(key) => json!({"type": "keyDown", "key": key as u8, "name": format!("{key:?}")}),
-		InputEvent::KeyUp(key) => json!({"type": "keyUp", "key": key as u8, "name": format!("{key:?}")}),
-		InputEvent::MouseMoveAbsolute(event) => json!({"type": "mouseMoveAbsolute", "x": event.x, "y": event.y,
-			"screenWidth": event.screen_width, "screenHeight": event.screen_height}),
-		InputEvent::MouseMoveRelative(event) => json!({"type": "mouseMoveRelative", "x": event.x, "y": event.y}),
-		InputEvent::MouseButtonDown(button) => json!({"type": "mouseButtonDown", "button": mouse_button(button)}),
-		InputEvent::MouseButtonUp(button) => json!({"type": "mouseButtonUp", "button": mouse_button(button)}),
-		InputEvent::MouseScrollVertical(event) => json!({"type": "scrollVertical", "amount": event.amount}),
-		InputEvent::MouseScrollHorizontal(event) => json!({"type": "scrollHorizontal", "amount": event.amount}),
-		InputEvent::Touch(touch) => json!({"type": "touch", "event": pointer_event(touch.event_kind),
-			"pointerId": touch.pointer_id, "x": touch.x, "y": touch.y}),
-		InputEvent::Pen(pen) => json!({"type": "pen", "event": pointer_event(pen.event_kind),
-			"tool": match pen.tool_kind { PenToolKind::Unknown => "unknown", PenToolKind::Pen => "pen", PenToolKind::Eraser => "eraser" },
-			"buttons": pen.buttons, "x": pen.x, "y": pen.y, "pressureOrDistance": pen.pressure_or_distance,
-			"rotation": pen.rotation, "tilt": pen.tilt}),
-		InputEvent::Utf8Text(text) => json!({"type": "text", "text": text}),
-	}
-}
-
-fn event_record(event: ServerEvent) -> Value {
+/// The binary record of `event` (see the module documentation).
+pub fn event_record(event: ServerEvent) -> Vec<u8> {
 	match event {
-		ServerEvent::PinRequired { client } => json!({"kind": "pinRequired", "client": client}),
-		ServerEvent::SessionStarted { width, height, fps, codec, bitrate, max_reference_frames, full_range } => json!({
-			"kind": "sessionStarted", "width": width, "height": height, "fps": fps,
-			"codec": match codec { Codec::H264 => "h264" }, "bitrate": bitrate,
-			"maxReferenceFrames": max_reference_frames, "fullRange": full_range,
-		}),
-		ServerEvent::KeyFrameRequested => json!({"kind": "keyFrameRequested"}),
-		ServerEvent::Input(input) => json!({"kind": "input", "input": input_record(input)}),
-		ServerEvent::SessionEnded => json!({"kind": "sessionEnded"}),
+		ServerEvent::PinRequired { client } => {
+			let mut record = vec![EVENT_PIN_REQUIRED];
+			push_string(&mut record, &client);
+			record
+		},
+		ServerEvent::SessionStarted { width, height, fps, codec, bitrate, max_reference_frames, full_range } => {
+			let mut record = vec![EVENT_SESSION_STARTED];
+			record.extend(width.to_le_bytes());
+			record.extend(height.to_le_bytes());
+			record.extend(fps.to_le_bytes());
+			record.push(match codec {
+				Codec::H264 => CODEC_H264,
+			});
+			record.extend((bitrate as u64).to_le_bytes());
+			record.extend(max_reference_frames.to_le_bytes());
+			record.push(u8::from(full_range));
+			record
+		},
+		ServerEvent::KeyFrameRequested => vec![EVENT_KEY_FRAME_REQUESTED],
+		ServerEvent::Input(input) => {
+			let mut record = vec![EVENT_INPUT];
+			record.extend(input.to_bytes());
+			record
+		},
+		ServerEvent::SessionEnded => vec![EVENT_SESSION_ENDED],
 	}
+}
+
+/// Reads the fields of a configuration record in order.
+struct ConfigurationReader<'a> {
+	rest: &'a [u8],
+}
+
+impl<'a> ConfigurationReader<'a> {
+	fn take(&mut self, count: usize, what: &str) -> anyhow::Result<&'a [u8]> {
+		ensure!(self.rest.len() >= count, "the configuration ends before its {what}");
+		let (taken, rest) = self.rest.split_at(count);
+		self.rest = rest;
+		Ok(taken)
+	}
+
+	fn port(&mut self, what: &str, default: u16) -> anyhow::Result<u16> {
+		let port = u16::from_le_bytes(self.take(2, what)?.try_into().expect("two bytes"));
+		Ok(if port == 0 { default } else { port })
+	}
+
+	fn string(&mut self, what: &str) -> anyhow::Result<String> {
+		let length = u32::from_le_bytes(self.take(4, what)?.try_into().expect("four bytes")) as usize;
+		let bytes = self.take(length, what)?;
+		String::from_utf8(bytes.to_vec()).with_context(|| format!("the configuration's {what} is not UTF-8"))
+	}
+}
+
+/// The server configuration in `bytes` (see the module documentation).
+fn read_configuration(bytes: &[u8]) -> anyhow::Result<ServerConfig> {
+	let mut reader = ConfigurationReader { rest: bytes };
+	let version = reader.take(1, "version")?[0];
+	ensure!(version == CONFIGURATION_VERSION, "configuration version {version} is not {CONFIGURATION_VERSION}");
+	let defaults = ServerPorts::default();
+	let ports = ServerPorts {
+		http: reader.port("HTTP port", defaults.http)?,
+		https: reader.port("HTTPS port", defaults.https)?,
+		rtsp: reader.port("RTSP port", defaults.rtsp)?,
+		video: reader.port("video port", defaults.video)?,
+		control: reader.port("control port", defaults.control)?,
+		audio: reader.port("audio port", defaults.audio)?,
+	};
+	let host_name = reader.string("host name")?;
+	let certificate_directory = PathBuf::from(reader.string("certificate directory")?);
+	let application_title = reader.string("application title")?;
+	let bind_address = reader.string("bind address")?;
+	ensure!(reader.rest.is_empty(), "the configuration has {} bytes after its last field", reader.rest.len());
+	Ok(ServerConfig { host_name, certificate_directory, application_title, bind_address, ports })
 }
 
 /// Writes `message` into the caller's buffer, as much as fits, and its full
@@ -182,39 +187,22 @@ unsafe fn write_message(message: &str, buffer: *mut u8, capacity: usize, length:
 }
 
 fn start(config: &[u8], doorbell: Doorbell, context: *mut c_void) -> anyhow::Result<NativeServer> {
-	let record: StartRecord = serde_json::from_slice(config)
-		.map_err(|error| anyhow::anyhow!("the server configuration is no valid record: {error}"))?;
-	let defaults = ServerPorts::default();
-	let ports = ServerPorts {
-		http: record.ports.http.unwrap_or(defaults.http),
-		https: record.ports.https.unwrap_or(defaults.https),
-		rtsp: record.ports.rtsp.unwrap_or(defaults.rtsp),
-		video: record.ports.video.unwrap_or(defaults.video),
-		control: record.ports.control.unwrap_or(defaults.control),
-		audio: record.ports.audio.unwrap_or(defaults.audio),
-	};
+	let config = read_configuration(config)?;
 	let queue = Arc::new(Queue {
 		events: Mutex::new(VecDeque::new()),
 		ring: Ring { doorbell, context: context as usize },
 	});
 	let sink = Arc::clone(&queue);
 	let server = Server::start(
-		ServerConfig {
-			host_name: record.host_name,
-			certificate_directory: record.certificate_directory,
-			application_title: record.application_title,
-			bind_address: record.bind_address,
-			ports,
-		},
+		config,
 		move |event| sink.push(event_record(event)),
 	)?;
 	Ok(NativeServer { server: Some(server), queue, last_error: Mutex::new(String::new()) })
 }
 
-/// Starts a server from the JSON configuration `config`: `hostName`,
-/// `certificateDirectory`, `applicationTitle`, `bindAddress` and optional
-/// `ports` (`http`, `https`, `rtsp`, `video`, `control`, `audio`). Returns
-/// null with the reason in `error` when the server does not start.
+/// Starts a server from the binary configuration `config` (see the module
+/// documentation). Returns null with the reason in `error` when the server
+/// does not start.
 #[unsafe(no_mangle)]
 pub extern "C" fn sandom_gamestream_start(config: *const u8, config_length: usize, doorbell: Option<Doorbell>,
 	context: *mut c_void, error: *mut u8, capacity: usize, error_length: *mut usize) -> *mut NativeServer {
@@ -313,4 +301,65 @@ pub extern "C" fn sandom_gamestream_last_error(server: *const NativeServer, buff
 	let mut length = 0;
 	unsafe { write_message(&server.last_error.lock(), buffer, capacity, &mut length) };
 	length
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::{
+		InputEvent, Key, MouseButton, MouseMoveAbsolute, MouseMoveRelative, MouseScrollHorizontal, MouseScrollVertical, Pen,
+		PenToolKind, PointerEventKind, Touch,
+	};
+
+	/// bindings/server.test.js decodes the same fixture into the events'
+	/// JavaScript records.
+	#[test]
+	fn event_records_match_the_binding_fixture() {
+		let events = [
+			ServerEvent::PinRequired { client: "C1".to_string() },
+			ServerEvent::SessionStarted {
+				width: 1280,
+				height: 720,
+				fps: 60,
+				codec: Codec::H264,
+				bitrate: 10_000_000,
+				max_reference_frames: 1,
+				full_range: false,
+			},
+			ServerEvent::KeyFrameRequested,
+			ServerEvent::Input(InputEvent::KeyDown(Key::A)),
+			ServerEvent::Input(InputEvent::MouseMoveAbsolute(MouseMoveAbsolute { x: -5, y: 96, screen_width: 1280, screen_height: 720 })),
+			ServerEvent::Input(InputEvent::MouseMoveRelative(MouseMoveRelative { x: -3, y: 4 })),
+			ServerEvent::Input(InputEvent::MouseButtonUp(MouseButton::Right)),
+			ServerEvent::Input(InputEvent::MouseScrollVertical(MouseScrollVertical { amount: -120 })),
+			ServerEvent::Input(InputEvent::MouseScrollHorizontal(MouseScrollHorizontal { amount: 240 })),
+			ServerEvent::Input(InputEvent::Touch(Touch { event_kind: PointerEventKind::Down, pointer_id: 2, x: 0.5, y: 0.25 })),
+			ServerEvent::Input(InputEvent::Pen(Pen {
+				event_kind: PointerEventKind::Move,
+				tool_kind: PenToolKind::Eraser,
+				buttons: 1,
+				x: 0.5,
+				y: 0.75,
+				pressure_or_distance: 0.25,
+				rotation: 90,
+				tilt: 30,
+			})),
+			ServerEvent::Input(InputEvent::Utf8Text("hé".to_string())),
+			ServerEvent::SessionEnded,
+		];
+		let encoded: Vec<String> = events
+			.into_iter()
+			.map(|event| event_record(event).iter().map(|byte| format!("{byte:02x}")).collect())
+			.collect();
+		let fixture: Vec<&str> = include_str!("../bindings/event-records.hex").lines().collect();
+		assert_eq!(encoded, fixture);
+	}
+
+	#[test]
+	fn a_configuration_record_names_its_fault() {
+		let error = read_configuration(&[2]).unwrap_err();
+		assert_eq!(error.to_string(), "configuration version 2 is not 1");
+		let error = read_configuration(&[1, 0, 0]).unwrap_err();
+		assert_eq!(error.to_string(), "the configuration ends before its HTTPS port");
+	}
 }

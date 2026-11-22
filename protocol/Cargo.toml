@@ -1,0 +1,21 @@
+[package]
+name = "sandom-gamestream-protocol"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause AND Apache-2.0"
+publish = false
+description = "The GameStream wire formats that the Sandom GameStream server and client share."
+
+[dependencies]
+aes = "0.9.1"
+aes-gcm = "0.10.3"
+anyhow = "1"
+aws-lc-rs = "1.17.0"
+fec-rs = { version = "0.1.0", features = ["parallel"] }
+rcgen = "0.14.8"
+rsa = "0.9.10"
+rustls-pemfile = "2.2.0"
+sha2 = "0.11.0"
+strum_macros = "0.28.0"
+tracing = "0.1.44"
+x509-parser = "0.18.1"

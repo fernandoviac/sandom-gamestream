@@ -3,18 +3,8 @@ use std::fs::File;
 use std::io::{BufReader, ErrorKind, Write};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 
-use rcgen::{
-	BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose, SerialNumber,
-};
-use rsa::rand_core::RngCore;
-use rsa::{
-	RsaPrivateKey,
-	pkcs8::{EncodePrivateKey, LineEnding},
-};
-
-
+use sandom_gamestream_protocol::pairing::create_identity;
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
@@ -48,10 +38,7 @@ struct LenientClientCertVerifier {
 }
 
 impl LenientClientCertVerifier {
-	fn new() -> Self {
-		let provider = CryptoProvider::get_default()
-			.cloned()
-			.unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+	fn new(provider: &CryptoProvider) -> Self {
 		Self {
 			supported_algs: provider.signature_verification_algorithms,
 		}
@@ -308,8 +295,14 @@ fn load_tls_files<P: AsRef<Path>>(certificate: P, private_key: P) -> Result<Serv
 	let certs = load_certs(certificate.as_ref())?;
 	let key = load_private_key(private_key.as_ref())?;
 
-	let config = ServerConfig::builder()
-		.with_client_cert_verifier(Arc::new(LenientClientCertVerifier::new()))
+	// The server names its crypto provider: a program that also links
+	// rustls with the ring provider (the Rust Mothership host) has no
+	// process default.
+	let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+	let config = ServerConfig::builder_with_provider(provider.clone())
+		.with_safe_default_protocol_versions()
+		.map_err(|e| tracing::error!("Failed to select the TLS protocol versions: {}", e))?
+		.with_client_cert_verifier(Arc::new(LenientClientCertVerifier::new(&provider)))
 		.with_single_cert(certs, key)
 		.map_err(|e| tracing::error!("Failed to create TLS configuration: {}", e))?;
 
@@ -332,49 +325,14 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, ()> {
 		.ok_or_else(|| tracing::error!("No private key found in file"))
 }
 
-/// Generate a self-signed TLS certificate and private key.
-///
-/// Creates a 2048-bit RSA key pair and a self-signed X.509 certificate valid for
-/// 10 years. The certificate includes the following properties:
-/// - Common Name: "Moonshine"
-/// - CA constraint: unconstrained (can sign other certificates)
-/// - Key usages: digital signature, key encipherment, key agreement
-/// - Serial number: random 64-bit value
-pub(crate) fn create_certificate() -> Result<(String, String), Box<dyn std::error::Error>> {
-	// rsa depends on rand_core 0.6, so we use its bundled OsRng
-	let mut rng = rsa::rand_core::OsRng;
-	let private_key = RsaPrivateKey::new(&mut rng, 2048)?;
-	let key_pem = private_key.to_pkcs8_pem(LineEnding::LF)?.to_string();
-
-	let mut params = CertificateParams::default();
-	params.not_before = SystemTime::now().into();
-	params.not_after = (SystemTime::now() + Duration::from_secs(3650 * 24 * 60 * 60)).into();
-	params.serial_number = Some(SerialNumber::from(rng.next_u64()));
-
-	let mut distinguished_name = DistinguishedName::new();
-	distinguished_name.push(DnType::CommonName, "Moonshine");
-	params.distinguished_name = distinguished_name;
-
-	params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-	params.key_usages = vec![
-		KeyUsagePurpose::DigitalSignature,
-		KeyUsagePurpose::KeyEncipherment,
-		KeyUsagePurpose::KeyAgreement,
-	];
-
-	let key_pair = KeyPair::from_pem(&key_pem)?;
-	let cert = params.self_signed(&key_pair)?;
-
-	Ok((cert.pem(), key_pem))
-}
-
 /// Load existing TLS certificate and private key from disk, or create new ones if they don't exist.
 pub fn load_or_create_certificate(cert_path: &Path, key_path: &Path) -> Result<(String, String), ()> {
 
 	if !cert_path.exists() && !key_path.exists() {
 		tracing::info!("No certificate found, creating a new one.");
 
-		let (cert, pkey) = create_certificate().map_err(|e| tracing::error!("Failed to create certificate: {e}"))?;
+		let identity = create_identity("Moonshine").map_err(|e| tracing::error!("Failed to create certificate: {e:#}"))?;
+		let (cert, pkey) = (identity.certificate_pem, identity.private_key_pem);
 
 		// Write certificate to file.
 		let cert_dir = cert_path

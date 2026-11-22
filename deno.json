@@ -1,6 +1,12 @@
 {
   "tasks": {
     "build": "cargo build --release --workspace && deno run --allow-read --allow-write --allow-run=codesign tools/align-macho-string-table.js target/release",
-    "proof": "deno task build && deno run --allow-ffi --allow-read --allow-write --allow-net --allow-env tools/binding-proof.js"
+    "proof": "deno task build && deno run --allow-ffi --allow-read --allow-write --allow-net --allow-env tools/binding-proof.js",
+    "test": "deno test --allow-read bindings/",
+    "unity:plugin": "deno task build && mkdir -p unity/Assets/Plugins/macOS && cp target/release/libsandom_gamestream_client.dylib unity/Assets/Plugins/macOS/",
+    "unity:players": "deno task unity:plugin && /Applications/Unity/Hub/Editor/6000.3.26f1/Unity.app/Contents/MacOS/Unity -batchmode -quit -projectPath unity -executeMethod Sandom.GameStream.Editor.GameStreamScenes.BuildPlayers -logFile unity/Logs/build-players.log"
+  },
+  "imports": {
+    "@std/assert": "jsr:@std/assert@1"
   }
 }

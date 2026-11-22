@@ -1,0 +1,9 @@
+/Library/
+/Logs/
+/Temp/
+/UserSettings/
+/obj/
+/Build/
+/smoke-output/
+/Assets/Plugins/macOS/libsandom_gamestream_client.dylib
+/Assets/Plugins/macOS/libsandom_gamestream_client.dylib.meta

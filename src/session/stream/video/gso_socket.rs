@@ -1,7 +1,7 @@
 use quinn_udp::{Transmit, UdpSockRef, UdpSocketState};
 use tokio::net::UdpSocket;
 
-use super::shard_batch::ShardBatch;
+use sandom_gamestream_protocol::video::ShardBatch;
 
 /// Maximum payload of one UDP datagram (65535 minus IPv4/UDP headers).
 /// A GSO batch is still one datagram: the kernel rejects anything larger

@@ -9,6 +9,11 @@ The GameStream protocol modules come from Moonshine
 under the BSD 2-Clause License. See LICENSE-MOONSHINE, and docs/legal/ for
 the upstream commit, the extracted items and the local modifications.
 
+vendor/tokio-enet is tokio-enet 0.1.1 (https://github.com/hgaiser/tokio-enet),
+Copyright (c) 2026, Hans Gaiser, under the BSD 2-Clause License, with one
+local modification. See vendor/tokio-enet/LICENSE and
+docs/legal/tokio-enet.md.
+
 The Sandom and DevBlanket names and marks are not licensed by the Apache
 License. Use of those names is permitted only as required for reasonable and
 customary attribution or as separately authorized by DevBlanket AB.
