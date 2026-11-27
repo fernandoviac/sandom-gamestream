@@ -1,5 +1,4 @@
-// Stages the npm packages of the GameStream server (slice 5 of
-// plans/PLAN-gamestream-runtimes.md) into dist/npm/:
+// Stages the npm packages of the GameStream server into dist/npm/:
 //
 // - `@sandom/gamestream`: the runtime bindings, which name each platform
 //   package as an optional dependency at the same version, so that npm

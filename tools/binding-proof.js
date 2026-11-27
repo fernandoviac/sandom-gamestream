@@ -1,6 +1,6 @@
-// The binding's acceptance (slice 3 of plans/PLAN-gamestream-runtimes.md),
-// the same program under Deno, Bun and Node: it starts the server through
-// bindings/mod.js on free local ports, reads /serverinfo, receives
+// The binding's acceptance proof, the same program under Deno, Bun and
+// Node: it starts the server through bindings/mod.js on free local ports,
+// reads /serverinfo, receives
 // `pinRequired` for the first phase of pairing, stops the server, and then
 // finds the pending pairing request answered and every TCP port closed. The
 // process then exits by itself, which shows that the server left no

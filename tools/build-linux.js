@@ -1,9 +1,8 @@
 // Builds the Linux library and Node addon of the GameStream server for the
 // machine's own architecture, inside a Debian bookworm container, so that
-// they need glibc 2.36 rather than the build machine's (slice 5 of
-// plans/PLAN-gamestream-runtimes.md). Run it on an arm64 machine for
-// linux-arm64 (Docker on Apple Silicon runs arm64 Linux natively) and on an
-// x64 machine for linux-x64. The build lands in
+// they need glibc 2.36 rather than the build machine's. Run it on an arm64
+// machine for linux-arm64 (Docker on Apple Silicon runs arm64 Linux
+// natively) and on an x64 machine for linux-x64. The build lands in
 // target/linux-<architecture>/release/, which tools/stage-packages.js takes:
 //
 //   deno run --allow-read --allow-run tools/build-linux.js

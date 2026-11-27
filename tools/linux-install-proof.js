@@ -1,6 +1,6 @@
 // Runs tools/install-proof.js for the machine's own Linux architecture inside
-// a Debian bookworm container (slice 5 of plans/PLAN-gamestream-runtimes.md),
-// such as Docker on Apple Silicon for linux-arm64. The server needs no GPU.
+// a Debian bookworm container, such as Docker on Apple Silicon for
+// linux-arm64. The server needs no GPU.
 // The container installs Deno and Bun beside the image's Node;
 // tools/stage-packages.js must have staged the platform's package first:
 //

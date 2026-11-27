@@ -1,7 +1,6 @@
 // Builds the macOS libraries and Node addons of the GameStream server for
-// both architectures, for the platform packages (slice 5 of
-// plans/PLAN-gamestream-runtimes.md). Rust records source paths in panic
-// locations; the build maps this repository to `sandom-gamestream` and
+// both architectures, for the platform packages. Rust records source paths
+// in panic locations; the build maps this repository to `sandom-gamestream` and
 // Cargo's home to `cargo`, so the libraries name no directory of the build
 // machine. The builds land in target/aarch64-apple-darwin/release/ and
 // target/x86_64-apple-darwin/release/, which tools/stage-packages.js takes;

@@ -1,6 +1,6 @@
-// The install proof of the GameStream server's npm packages (slice 5 of
-// plans/PLAN-gamestream-runtimes.md). It packs the packages that
-// tools/stage-packages.js staged for this machine's platform, installs them
+// The install proof of the GameStream server's npm packages. It packs the
+// packages that tools/stage-packages.js staged for this machine's platform,
+// installs them
 // with npm into an empty directory from those archives alone (an empty
 // cache, `--offline`), and then, under Deno, Bun and Node, imports the
 // bindings from the install, finds the library of the installed platform
